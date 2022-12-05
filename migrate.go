@@ -46,13 +46,15 @@ func (m *Migration) Migrate() error {
 	if err != nil {
 		return err
 	}
-	var newVersion int
+	if len(files) == 0 {
+		return ErrNoChange
+	}
 	for i, f := range files {
 		b, err := os.ReadFile(m.baseDir + "/" + f.Name())
 		if err != nil {
 			return err
 		}
-		newVersion, err = strconv.Atoi(strings.Split(f.Name(), "_")[0])
+		newVersion, err := strconv.Atoi(strings.Split(f.Name(), "_")[0])
 		lastVersion.Version = int64(newVersion)
 		if err != nil {
 			return err
@@ -77,8 +79,7 @@ func (m *Migration) Rollback() error {
 		return err
 	}
 	if lastVersion.Version == 0 || len(files) == 0 {
-		fmt.Println(ErrNoChange.Error())
-		return nil
+		return ErrNoChange
 	}
 	for i, f := range files {
 		b, err := os.ReadFile(m.baseDir + "/" + f.Name())
