@@ -1,5 +1,13 @@
 # Golang migrate
 
+### Install
+
+```
+go get -u github.com/LineoIT/go-migrate
+```
+
+### How to use
+
 ```go
 package main
 
