@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	TIME_LAYOUT = "20060201150405"
+	TIME_LAYOUT = "20060102150405"
 )
 
 type Version struct {
