@@ -27,3 +27,4 @@ go.work
 .env.local
 tmp
 .dev*
+build
