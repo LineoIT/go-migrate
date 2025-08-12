@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,51 +50,107 @@ func (m *Migration) Migrate() error {
 	if len(files) == 0 {
 		return ErrNoChange
 	}
-	for i, f := range files {
-		b, err := os.ReadFile(m.baseDir + "/" + f.Name())
-		if err != nil {
-			return err
-		}
-		newVersion, err := strconv.Atoi(strings.Split(f.Name(), "_")[0])
-		lastVersion.Version = int64(newVersion)
-		if err != nil {
-			return err
-		}
-		_, err = m.Exec(string(b))
-		if err != nil {
-			d := true
-			lastVersion.IsDirty = &d
-			lastVersion.Create(m)
-			return fmt.Errorf(string(b)+"%s\n", err)
-		}
-		lastVersion.Create(m)
-		fmt.Printf("%d/%d  %s\n", i+1, len(files), f.Name())
-	}
-	return nil
-}
 
-// ! Rollback all migrations from database
-func (m *Migration) Rollback() error {
-	files, lastVersion, err := m.getFiles("down")
+	tx, err := m.Begin()
 	if err != nil {
 		return err
 	}
-	if lastVersion.Version == 0 || len(files) == 0 {
-		return ErrNoChange
-	}
+
 	for i, f := range files {
 		b, err := os.ReadFile(m.baseDir + "/" + f.Name())
 		if err != nil {
+			tx.Rollback()
 			return err
 		}
-		_, err = m.Exec(string(b))
+
+		newVersion, err := strconv.Atoi(strings.Split(f.Name(), "__")[0])
 		if err != nil {
-			return fmt.Errorf(string(b)+"%s\n", err)
+			tx.Rollback()
+			return err
 		}
+
+		lastVersion.Version = int64(newVersion)
+
+		_, err = tx.Exec(string(b))
+		if err != nil {
+			tx.Rollback()
+			d := true
+			lastVersion.IsDirty = &d
+			lastVersion.Create(m)
+			return fmt.Errorf("%s: %v\n", f.Name(), err)
+		}
+		lastVersion.Create(m)
+
 		fmt.Printf("%d/%d  %s\n", i+1, len(files), f.Name())
 	}
-	err = m.Clean()
-	return err
+
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return nil
+}
+
+
+// ! Rollback all migrations from database
+func (m *Migration) Rollback() error {
+    lastVersion, err := m.GetLastVersion()
+    if err != nil {
+        return err
+    }
+    if lastVersion.Version == 0 {
+        return ErrNoChange
+    }
+
+    fmt.Printf("Last version : %d\n", lastVersion.Version)
+
+    files, _, err := m.getFiles("down")
+    if err != nil {
+        return err
+    }
+
+    expectedPrefix := fmt.Sprintf("%03d__", lastVersion.Version)
+    var downFile fs.DirEntry
+    for _, f := range files {
+        if strings.HasPrefix(f.Name(), expectedPrefix) && strings.HasSuffix(f.Name(), ".down.sql") {
+            downFile = f
+            break
+        }
+    }
+
+    if downFile == nil {
+        return fmt.Errorf("rollback: no file .down.sql for version %d", lastVersion.Version)
+    }
+
+    b, err := os.ReadFile(filepath.Join(m.baseDir, downFile.Name()))
+    if err != nil {
+        return err
+    }
+
+    tx, err := m.Begin()
+    if err != nil {
+        return err
+    }
+
+    if _, err := tx.Exec(string(b)); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("%s: %v", downFile.Name(), err)
+    }
+
+    if _, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE version=$1", m.Config.Table), lastVersion.Version); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("erreur deleting migration version: %v", err)
+    }
+
+    if err := tx.Commit(); err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    fmt.Printf("Rollback migration version %d successfully.\n", lastVersion.Version)
+    return nil
 }
 
 // Clean delete all migrations versions
@@ -146,6 +203,16 @@ func (m *Migration) GetVersions() ([]Version, error) {
 	return result, nil
 }
 
+// Begin démarre une nouvelle transaction
+func (m *Migration) Begin() (*sql.Tx, error) {
+	tx, err := m.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+
 func (m *Migration) createTable() error {
 	_, err := m.Exec(fmt.Sprintf(`create table if not exists %s(
 		 version varchar(60) not null unique,
@@ -156,31 +223,54 @@ func (m *Migration) createTable() error {
 	return err
 }
 
+
 func (m *Migration) getFiles(migrateType string) (fss []fs.DirEntry, lastVersion Version, err error) {
-	files, err := os.ReadDir(m.baseDir)
-	if err != nil {
-		return fss, lastVersion, err
-	}
-	lastVersion, err = m.GetLastVersion()
-	if err != nil {
-		return fss, lastVersion, err
-	}
-	for _, f := range files {
-		if !f.IsDir() && strings.HasSuffix(f.Name(), "."+migrateType+".sql") {
-			if migrateType == "down" {
-				fss = append(fss, f)
-			} else {
-				currentVersion, _ := strconv.Atoi(strings.Split(f.Name(), "_")[0])
-				if lastVersion.Version == 0 || int64(currentVersion) > lastVersion.Version {
-					fss = append(fss, f)
-				}
-			}
-		}
-	}
-	if migrateType == "down" {
-		sort.Slice(fss, func(i, j int) bool {
-			return fss[i].Name() > fss[j].Name()
-		})
-	}
-	return fss, lastVersion, nil
+    files, err := os.ReadDir(m.baseDir)
+    if err != nil {
+        return fss, lastVersion, err
+    }
+
+    lastVersion, err = m.GetLastVersion()
+    if err != nil {
+        return fss, lastVersion, err
+    }
+
+    for _, f := range files {
+        if f.IsDir() {
+            continue
+        }
+        if !strings.HasSuffix(f.Name(), "."+migrateType+".sql") {
+            continue
+        }
+
+        parts := strings.SplitN(f.Name(), "__", 2)
+        if len(parts) < 2 {
+            continue
+        }
+
+        currentVersion, err := strconv.Atoi(parts[0])
+        if err != nil {
+            continue
+        }
+
+        if migrateType == "up" {
+            if lastVersion.Version == 0 || int64(currentVersion) > lastVersion.Version {
+                fss = append(fss, f)
+            }
+        } else if migrateType == "down" {
+            if lastVersion.Version > 0 && int64(currentVersion) <= lastVersion.Version {
+                fss = append(fss, f)
+            }
+        }
+    }
+
+    // Sort: "up" ascending, "down" descending
+    sort.Slice(fss, func(i, j int) bool {
+        if migrateType == "up" {
+            return fss[i].Name() < fss[j].Name()
+        }
+        return fss[i].Name() > fss[j].Name()
+    })
+
+    return fss, lastVersion, nil
 }
